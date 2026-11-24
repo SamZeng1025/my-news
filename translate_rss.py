@@ -126,12 +126,12 @@ for key, (cn_name, url) in FEEDS.items():
         link = entry.get("link", url)
         published = entry.get("published", "")
 
-        # 单家媒体独立源也统一附上完整出处链接
+        # 单家媒体独立源：有摘要时在摘要与出处间加分割线
         fe = fg.add_entry()
         fe.id(link)
         fe.title(zh_title)
         fe.link(href=link)
-        desc_html = f"{zh_summary}<br><br>" if zh_summary else ""
+        desc_html = f"{zh_summary}<hr>" if zh_summary else ""
         source_html = f"<b>报道出处：</b><br>• [{cn_name}] <a href='{link}'>{zh_title}</a><br><small>原文：{raw_title}</small>"
         fe.description(f"{desc_html}{source_html}")
         if published:
@@ -171,7 +171,7 @@ for item in all_items:
     if not matched:
         unique_items.append(item)
 
-# 3. 生成最终去重聚合总源 (all.xml)，强制输出全量出处列表
+# 3. 生成最终去重聚合总源 (all.xml)
 fg_all = FeedGenerator()
 fg_all.title("全球外媒热点 (10家去重版)")
 fg_all.link(href="https://github.com")
@@ -181,7 +181,6 @@ for item in unique_items[:40]:
     fe = fg_all.add_entry()
     fe.id(item["link"])
 
-    # 将主媒体与所有关联媒体合并为全量信源列表
     all_sources = [item] + item["related"]
     total_sources = len(all_sources)
 
@@ -190,7 +189,6 @@ for item in unique_items[:40]:
     else:
         title_prefix = f"[{item['source']}] "
 
-    # 无论1家还是多家，末尾固定列出全部出处的媒体名、中文标题、英文原题与可点击链接
     sources_list_html = f"<b>报道出处（共 {total_sources} 家，点击查阅原文）：</b><br>" + "<br><br>".join(
         [
             f"• <b>[{s['source']}]</b> <a href='{s['link']}'>{s['zh_title']}</a><br><small>原文：{s['raw_title']}</small>"
@@ -198,7 +196,8 @@ for item in unique_items[:40]:
         ]
     )
 
-    desc_html = f"{item['zh_summary']}<br><br>" if item["zh_summary"] else ""
+    # 有摘要时在摘要与出处之间加入分割线 <hr>
+    desc_html = f"{item['zh_summary']}<hr>" if item["zh_summary"] else ""
     fe.title(f"{title_prefix}{item['zh_title']}")
     fe.link(href=item["link"])
     fe.description(f"{desc_html}{sources_list_html}")
