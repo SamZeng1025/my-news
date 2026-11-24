@@ -6,7 +6,6 @@ import feedparser
 from email.utils import parsedate_to_datetime
 from feedgen.feed import FeedGenerator
 
-# 10大顶级外媒源（优先采用带完整摘要的官方源）
 FEEDS = {
     "bbc": ("BBC", "http://feeds.bbci.co.uk/news/world/rss.xml"),
     "cnbc": ("CNBC", "https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=100727362"),
@@ -38,7 +37,6 @@ def clean_html(text):
     return re.sub(r'\s+', ' ', text).strip()
 
 def has_real_summary(title, summary):
-    """判断摘要是否为有效正文导语，过滤掉抄标题的复读机摘要"""
     if not summary or len(summary) < 25:
         return False
     t_clean = re.sub(r'\W+', '', title.lower())
@@ -92,7 +90,7 @@ def google_translate(text):
 os.makedirs("public", exist_ok=True)
 all_items = []
 
-# 1. 抓取并翻译10家媒体（每家取最新8条，兼顾覆盖面与速度）
+# 1. 抓取并翻译10家媒体
 for key, (cn_name, url) in FEEDS.items():
     try:
         resp = requests.get(url, headers=HEADERS, timeout=15)
@@ -128,13 +126,14 @@ for key, (cn_name, url) in FEEDS.items():
         link = entry.get("link", url)
         published = entry.get("published", "")
 
-        # 写入单家媒体独立源
+        # 单家媒体独立源也统一附上完整出处链接
         fe = fg.add_entry()
         fe.id(link)
         fe.title(zh_title)
         fe.link(href=link)
         desc_html = f"{zh_summary}<br><br>" if zh_summary else ""
-        fe.description(f"{desc_html}<small>原文标题：{raw_title}</small>")
+        source_html = f"<b>报道出处：</b><br>• [{cn_name}] <a href='{link}'>{zh_title}</a><br><small>原文：{raw_title}</small>"
+        fe.description(f"{desc_html}{source_html}")
         if published:
             fe.published(published)
 
@@ -154,7 +153,7 @@ for key, (cn_name, url) in FEEDS.items():
     fg.rss_file(f"public/{key}.xml")
     print(f"已生成: public/{key}.xml")
 
-# 2. 按发布时间倒序排列并执行智能去重
+# 2. 按发布时间倒序排列并执行跨媒体去重
 all_items.sort(key=lambda x: x["timestamp"], reverse=True)
 unique_items = []
 
@@ -164,7 +163,6 @@ for item in all_items:
         if is_duplicate(item["keywords"], u["keywords"]):
             if item["source"] != u["source"] and all(r["source"] != item["source"] for r in u["related"]):
                 u["related"].append(item)
-                # 如果主条目没有摘要，而合并进来的媒体有摘要，自动借用它的摘要
                 if not u["has_summary"] and item["has_summary"]:
                     u["zh_summary"] = f"（据{item['source']}摘要）{item['zh_summary']}"
                     u["has_summary"] = True
@@ -173,7 +171,7 @@ for item in all_items:
     if not matched:
         unique_items.append(item)
 
-# 3. 生成最终的去重聚合总源 (all.xml)
+# 3. 生成最终去重聚合总源 (all.xml)，强制输出全量出处列表
 fg_all = FeedGenerator()
 fg_all.title("全球外媒热点 (10家去重版)")
 fg_all.link(href="https://github.com")
@@ -183,20 +181,27 @@ for item in unique_items[:40]:
     fe = fg_all.add_entry()
     fe.id(item["link"])
 
-    if item["related"]:
-        total_sources = len(item["related"]) + 1
+    # 将主媒体与所有关联媒体合并为全量信源列表
+    all_sources = [item] + item["related"]
+    total_sources = len(all_sources)
+
+    if total_sources > 1:
         title_prefix = f"[{item['source']}等{total_sources}家] "
-        related_html = "<br><br><b>其他媒体同步报道：</b><br>" + "<br>".join(
-            [f"• [{r['source']}] <a href='{r['link']}'>{r['zh_title']}</a>" for r in item["related"]]
-        )
     else:
         title_prefix = f"[{item['source']}] "
-        related_html = ""
+
+    # 无论1家还是多家，末尾固定列出全部出处的媒体名、中文标题、英文原题与可点击链接
+    sources_list_html = f"<b>报道出处（共 {total_sources} 家，点击查阅原文）：</b><br>" + "<br><br>".join(
+        [
+            f"• <b>[{s['source']}]</b> <a href='{s['link']}'>{s['zh_title']}</a><br><small>原文：{s['raw_title']}</small>"
+            for s in all_sources
+        ]
+    )
 
     desc_html = f"{item['zh_summary']}<br><br>" if item["zh_summary"] else ""
     fe.title(f"{title_prefix}{item['zh_title']}")
     fe.link(href=item["link"])
-    fe.description(f"{desc_html}<small>原文标题：{item['raw_title']}</small>{related_html}")
+    fe.description(f"{desc_html}{sources_list_html}")
     if item["published"]:
         fe.published(item["published"])
 
