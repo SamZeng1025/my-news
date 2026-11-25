@@ -21,7 +21,7 @@ FEEDS = {
 }
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36 Edg/124.0.0.0"
 }
 
 STOP_WORDS = {
@@ -31,8 +31,137 @@ STOP_WORDS = {
     "into", "about", "up", "out", "will", "has", "have", "had", "its", "us"
 }
 
+# 全局状态：记录各引擎是否被限流 & 复用微软令牌
+ENGINE_BLOCKED = {"google_gtx": False, "google_c5": False, "edge": False}
+EDGE_TOKEN = None
+
+def get_edge_token():
+    """全局只获取一次微软 Edge 翻译令牌，避免重复鉴权被封"""
+    global EDGE_TOKEN
+    if EDGE_TOKEN:
+        return EDGE_TOKEN
+    try:
+        r = requests.get("https://edge.microsoft.com/translate/auth", headers=HEADERS, timeout=10)
+        if r.status_code == 200 and r.text:
+            EDGE_TOKEN = r.text.strip()
+            print("成功获取微软 Edge 翻译令牌")
+            return EDGE_TOKEN
+        else:
+            print(f"获取微软令牌失败: HTTP {r.status_code}")
+            ENGINE_BLOCKED["edge"] = True
+    except Exception as e:
+        print(f"获取微软令牌异常: {e}")
+        ENGINE_BLOCKED["edge"] = True
+    return None
+
+def translate_text(text):
+    """四重免费引擎自动兜底：Google gtx -> Google clients5 -> Microsoft Edge -> MyMemory"""
+    if not text:
+        return ""
+    text = text[:1500]
+
+    # 引擎 1: 谷歌主接口
+    if not ENGINE_BLOCKED["google_gtx"]:
+        try:
+            r = requests.get(
+                "https://translate.googleapis.com/translate_a/single",
+                params={"client": "gtx", "sl": "en", "tl": "zh-CN", "dt": "t", "q": text},
+                headers=HEADERS,
+                timeout=8
+            )
+            if r.status_code == 200:
+                res = "".join([item[0] for item in r.json()[0] if item[0]])
+                if res and re.search(r'[\u4e00-\u9fff]', res):
+                    time.sleep(0.5)
+                    return res
+            else:
+                print(f"引擎1(Google gtx) 限流: HTTP {r.status_code}")
+                ENGINE_BLOCKED["google_gtx"] = True
+        except Exception as e:
+            print(f"引擎1异常: {e}")
+            ENGINE_BLOCKED["google_gtx"] = True
+
+    # 引擎 2: 谷歌客户端备用接口 (clients5)
+    if not ENGINE_BLOCKED["google_c5"]:
+        try:
+            r = requests.get(
+                "https://clients5.google.com/translate_a/t",
+                params={"client": "dict-chrome-ex", "sl": "en", "tl": "zh-CN", "q": text},
+                headers=HEADERS,
+                timeout=8
+            )
+            if r.status_code == 200:
+                data = r.json()
+                res = data[0] if isinstance(data, list) and isinstance(data[0], str) else ""
+                if res and re.search(r'[\u4e00-\u9fff]', res):
+                    time.sleep(0.5)
+                    return res
+            else:
+                print(f"引擎2(Google c5) 限流: HTTP {r.status_code}")
+                ENGINE_BLOCKED["google_c5"] = True
+        except Exception as e:
+            print(f"引擎2异常: {e}")
+            ENGINE_BLOCKED["google_c5"] = True
+
+    # 引擎 3: 微软 Edge 接口（复用单次令牌）
+    if not ENGINE_BLOCKED["edge"]:
+        token = get_edge_token()
+        if token:
+            try:
+                r = requests.post(
+                    "https://api-edge.cognitive.microsofttranslator.com/translate",
+                    params={"from": "en", "to": "zh-Hans", "api-version": "3.0"},
+                    headers={
+                        "Authorization": f"Bearer {token}",
+                        "Content-Type": "application/json",
+                        "User-Agent": HEADERS["User-Agent"]
+                    },
+                    json=[{"Text": text}],
+                    timeout=10
+                )
+                if r.status_code == 200:
+                    res = r.json()[0]["translations"][0]["text"]
+                    if res and re.search(r'[\u4e00-\u9fff]', res):
+                        time.sleep(0.4)
+                        return res
+                else:
+                    print(f"引擎3(Microsoft Edge) 失败: HTTP {r.status_code}")
+                    ENGINE_BLOCKED["edge"] = True
+            except Exception as e:
+                print(f"引擎3异常: {e}")
+                ENGINE_BLOCKED["edge"] = True
+
+    # 引擎 4: MyMemory 免费接口最终兜底
+    try:
+        r = requests.get(
+            "https://api.mymemory.translated.net/get",
+            params={"q": text[:500], "langpair": "en|zh-CN"},
+            headers=HEADERS,
+            timeout=10
+        )
+        if r.status_code == 200:
+            res = r.json().get("responseData", {}).get("translatedText", "")
+            if res and re.search(r'[\u4e00-\u9fff]', res) and "MYMEMORY WARNING" not in res:
+                time.sleep(0.5)
+                return res
+    except Exception as e:
+        print(f"引擎4(MyMemory) 异常: {e}")
+
+    return text
+
+def translate_pair(title, summary):
+    """合并标题与摘要为单次请求，减少一半API调用次数"""
+    if not summary:
+        return translate_text(title), ""
+    sep = "\n###\n"
+    combined = translate_text(f"{title}{sep}{summary}")
+    if "###" in combined:
+        parts = combined.split("###", 1)
+        return parts[0].strip(), parts[1].strip()
+    # 如果分隔符意外丢失，退回单独翻译标题
+    return translate_text(title), ""
+
 def load_cache():
-    """从已发布的 GitHub Pages 拉取历史翻译缓存，避免重复翻译耗尽额度"""
     repo = os.environ.get("GITHUB_REPOSITORY", "")
     if "/" in repo:
         owner, name = repo.split("/", 1)
@@ -84,61 +213,12 @@ def get_timestamp(pub_str):
     except Exception:
         return 0
 
-def translate_with_edge(text):
-    """备用引擎：微软 Edge 免费翻译接口"""
-    try:
-        auth_resp = requests.get("https://edge.microsoft.com/translate/auth", headers=HEADERS, timeout=8)
-        if auth_resp.status_code == 200:
-            token = auth_resp.text
-            url = "https://api-edge.cognitive.microsofttranslator.com/translate"
-            params = {"from": "en", "to": "zh-Hans", "api-version": "3.0"}
-            headers = {
-                "Authorization": f"Bearer {token}",
-                "Content-Type": "application/json"
-            }
-            r = requests.post(url, params=params, headers=headers, json=[{"Text": text[:1500]}], timeout=10)
-            if r.status_code == 200:
-                return r.json()[0]["translations"][0]["text"]
-    except Exception as e:
-        print(f"Edge 备用翻译失败: {e}")
-    return None
-
-def smart_translate(text):
-    """主引擎谷歌 + 备用引擎微软双保险"""
-    if not text:
-        return ""
-    # 1. 尝试谷歌接口
-    try:
-        r = requests.get(
-            "https://translate.googleapis.com/translate_a/single",
-            params={"client": "gtx", "sl": "en", "tl": "zh-CN", "dt": "t", "q": text[:1500]},
-            headers=HEADERS,
-            timeout=8
-        )
-        if r.status_code == 200:
-            res = "".join([item[0] for item in r.json()[0] if item[0]])
-            if res and res != text:
-                time.sleep(0.8)  # 放慢节奏防止触发谷歌风控
-                return res
-        else:
-            print(f"谷歌翻译触发限流 (HTTP {r.status_code})，切换至微软备用接口...")
-    except Exception:
-        pass
-
-    # 2. 谷歌失败或被限流时，自动切换微软 Edge 接口
-    edge_res = translate_with_edge(text)
-    if edge_res:
-        time.sleep(0.5)
-        return edge_res
-
-    return text
-
 os.makedirs("public", exist_ok=True)
 cache = load_cache()
 new_cache = {}
 all_items = []
 
-# 1. 抓取并增量翻译10家媒体（每家取最新5条，减少无效请求）
+# 1. 抓取并增量翻译10家媒体
 for key, (cn_name, url) in FEEDS.items():
     try:
         resp = requests.get(url, headers=HEADERS, timeout=15)
@@ -164,16 +244,13 @@ for key, (cn_name, url) in FEEDS.items():
         link = entry.get("link", url)
         published = entry.get("published", "")
 
-        # 优先命中缓存（仅当缓存里的翻译确实包含中文时才复用，防止把之前未翻译成功的英文缓存下来）
         cached_item = cache.get(link)
         if cached_item and re.search(r'[\u4e00-\u9fff]', cached_item.get("zh_title", "")):
             zh_title = cached_item["zh_title"]
             zh_summary = cached_item.get("zh_summary", "")
         else:
-            zh_title = smart_translate(raw_title)
-            zh_summary = smart_translate(raw_summary) if valid_summary else ""
+            zh_title, zh_summary = translate_pair(raw_title, raw_summary if valid_summary else "")
 
-        # 仅将成功翻译出中文的结果写入新缓存
         if re.search(r'[\u4e00-\u9fff]', zh_title):
             new_cache[link] = {"zh_title": zh_title, "zh_summary": zh_summary}
 
@@ -203,7 +280,7 @@ for key, (cn_name, url) in FEEDS.items():
     fg.rss_file(f"public/{key}.xml")
     print(f"已生成: public/{key}.xml")
 
-# 保存最新翻译缓存供下一次运行复用（最多保留最近500条防膨胀）
+# 保存翻译缓存
 if len(new_cache) > 500:
     keys_to_keep = list(new_cache.keys())[-500:]
     new_cache = {k: new_cache[k] for k in keys_to_keep}
