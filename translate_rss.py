@@ -31,12 +31,12 @@ STOP_WORDS = {
     "into", "about", "up", "out", "will", "has", "have", "had", "its", "us"
 }
 
-# 全局状态：记录各引擎是否被限流 & 复用微软令牌
+CACHE_TTL = 48 * 3600  # 缓存有效期：48小时
+CACHE_FILE = "public/cache.json"
 ENGINE_BLOCKED = {"google_gtx": False, "google_c5": False, "edge": False}
 EDGE_TOKEN = None
 
 def get_edge_token():
-    """全局只获取一次微软 Edge 翻译令牌，避免重复鉴权被封"""
     global EDGE_TOKEN
     if EDGE_TOKEN:
         return EDGE_TOKEN
@@ -44,13 +44,9 @@ def get_edge_token():
         r = requests.get("https://edge.microsoft.com/translate/auth", headers=HEADERS, timeout=10)
         if r.status_code == 200 and r.text:
             EDGE_TOKEN = r.text.strip()
-            print("成功获取微软 Edge 翻译令牌")
             return EDGE_TOKEN
-        else:
-            print(f"获取微软令牌失败: HTTP {r.status_code}")
-            ENGINE_BLOCKED["edge"] = True
-    except Exception as e:
-        print(f"获取微软令牌异常: {e}")
+        ENGINE_BLOCKED["edge"] = True
+    except Exception:
         ENGINE_BLOCKED["edge"] = True
     return None
 
@@ -60,7 +56,6 @@ def translate_text(text):
         return ""
     text = text[:1500]
 
-    # 引擎 1: 谷歌主接口
     if not ENGINE_BLOCKED["google_gtx"]:
         try:
             r = requests.get(
@@ -77,11 +72,9 @@ def translate_text(text):
             else:
                 print(f"引擎1(Google gtx) 限流: HTTP {r.status_code}")
                 ENGINE_BLOCKED["google_gtx"] = True
-        except Exception as e:
-            print(f"引擎1异常: {e}")
+        except Exception:
             ENGINE_BLOCKED["google_gtx"] = True
 
-    # 引擎 2: 谷歌客户端备用接口 (clients5)
     if not ENGINE_BLOCKED["google_c5"]:
         try:
             r = requests.get(
@@ -99,11 +92,9 @@ def translate_text(text):
             else:
                 print(f"引擎2(Google c5) 限流: HTTP {r.status_code}")
                 ENGINE_BLOCKED["google_c5"] = True
-        except Exception as e:
-            print(f"引擎2异常: {e}")
+        except Exception:
             ENGINE_BLOCKED["google_c5"] = True
 
-    # 引擎 3: 微软 Edge 接口（复用单次令牌）
     if not ENGINE_BLOCKED["edge"]:
         token = get_edge_token()
         if token:
@@ -127,11 +118,9 @@ def translate_text(text):
                 else:
                     print(f"引擎3(Microsoft Edge) 失败: HTTP {r.status_code}")
                     ENGINE_BLOCKED["edge"] = True
-            except Exception as e:
-                print(f"引擎3异常: {e}")
+            except Exception:
                 ENGINE_BLOCKED["edge"] = True
 
-    # 引擎 4: MyMemory 免费接口最终兜底
     try:
         r = requests.get(
             "https://api.mymemory.translated.net/get",
@@ -144,37 +133,67 @@ def translate_text(text):
             if res and re.search(r'[\u4e00-\u9fff]', res) and "MYMEMORY WARNING" not in res:
                 time.sleep(0.5)
                 return res
-    except Exception as e:
-        print(f"引擎4(MyMemory) 异常: {e}")
+    except Exception:
+        pass
 
     return text
 
 def translate_pair(title, summary):
-    """合并标题与摘要为单次请求，减少一半API调用次数"""
     if not summary:
         return translate_text(title), ""
-    sep = "\n###\n"
-    combined = translate_text(f"{title}{sep}{summary}")
+    combined = translate_text(f"{title}\n###\n{summary}")
     if "###" in combined:
         parts = combined.split("###", 1)
         return parts[0].strip(), parts[1].strip()
-    # 如果分隔符意外丢失，退回单独翻译标题
     return translate_text(title), ""
 
-def load_cache():
-    repo = os.environ.get("GITHUB_REPOSITORY", "")
-    if "/" in repo:
-        owner, name = repo.split("/", 1)
-        cache_url = f"https://{owner}.github.io/{name}/cache.json"
+def load_state():
+    """优先读本地缓存(VPS)，其次读GitHub Pages云端缓存，并自动兼容旧版格式"""
+    raw = None
+    if os.path.exists(CACHE_FILE):
         try:
-            r = requests.get(cache_url, timeout=10)
-            if r.status_code == 200:
-                data = r.json()
-                print(f"成功加载历史翻译缓存: {len(data)} 条")
-                return data
+            with open(CACHE_FILE, "r", encoding="utf-8") as f:
+                raw = json.load(f)
         except Exception:
             pass
-    return {}
+
+    if raw is None:
+        repo = os.environ.get("GITHUB_REPOSITORY", "")
+        if "/" in repo:
+            owner, name = repo.split("/", 1)
+            try:
+                r = requests.get(f"https://{owner}.github.io/{name}/cache.json", timeout=10)
+                if r.status_code == 200:
+                    raw = r.json()
+            except Exception:
+                pass
+
+    now = time.time()
+    state = {"translations": {}, "events": []}
+    if not isinstance(raw, dict):
+        return state
+
+    # 兼容旧版纯字典格式
+    if "translations" not in raw and "events" not in raw:
+        for k, v in raw.items():
+            if isinstance(v, dict) and "zh_title" in v:
+                state["translations"][k] = {
+                    "zh_title": v["zh_title"],
+                    "zh_summary": v.get("zh_summary", ""),
+                    "ts": now
+                }
+        return state
+
+    # 清理超过 48 小时的过期译文与事件
+    for k, v in raw.get("translations", {}).items():
+        if now - v.get("ts", 0) <= CACHE_TTL:
+            state["translations"][k] = v
+    for ev in raw.get("events", []):
+        if now - ev.get("first_seen", 0) <= CACHE_TTL:
+            state["events"].append(ev)
+
+    print(f"加载48h缓存成功: 译文 {len(state['translations'])} 条, 活跃事件 {len(state['events'])} 个")
+    return state
 
 def clean_html(text):
     if not text:
@@ -193,30 +212,33 @@ def has_real_summary(title, summary):
 
 def extract_keywords(title):
     words = re.findall(r'[a-z0-9]+', title.lower())
-    return {w for w in words if len(w) > 2 and w not in STOP_WORDS}
+    return list({w for w in words if len(w) > 2 and w not in STOP_WORDS})
 
 def is_duplicate(kw1, kw2):
-    if not kw1 or not kw2:
+    s1, s2 = set(kw1), set(kw2)
+    if not s1 or not s2:
         return False
-    common = kw1 & kw2
+    common = s1 & s2
     if len(common) >= 3:
         return True
-    if len(common) >= 2 and (len(common) / min(len(kw1), len(kw2))) >= 0.5:
+    if len(common) >= 2 and (len(common) / min(len(s1), len(s2))) >= 0.5:
         return True
     return False
 
 def get_timestamp(pub_str):
     if not pub_str:
-        return 0
+        return time.time()
     try:
         return parsedate_to_datetime(pub_str).timestamp()
     except Exception:
-        return 0
+        return time.time()
 
 os.makedirs("public", exist_ok=True)
-cache = load_cache()
-new_cache = {}
-all_items = []
+now = time.time()
+state = load_state()
+translations = state["translations"]
+events = state["events"]
+new_fetched_items = []
 
 # 1. 抓取并增量翻译10家媒体
 for key, (cn_name, url) in FEEDS.items():
@@ -243,16 +265,16 @@ for key, (cn_name, url) in FEEDS.items():
         valid_summary = has_real_summary(raw_title, raw_summary)
         link = entry.get("link", url)
         published = entry.get("published", "")
+        ts = get_timestamp(published)
 
-        cached_item = cache.get(link)
-        if cached_item and re.search(r'[\u4e00-\u9fff]', cached_item.get("zh_title", "")):
-            zh_title = cached_item["zh_title"]
-            zh_summary = cached_item.get("zh_summary", "")
+        cached_t = translations.get(link)
+        if cached_t and re.search(r'[\u4e00-\u9fff]', cached_t.get("zh_title", "")):
+            zh_title = cached_t["zh_title"]
+            zh_summary = cached_t.get("zh_summary", "")
         else:
             zh_title, zh_summary = translate_pair(raw_title, raw_summary if valid_summary else "")
-
-        if re.search(r'[\u4e00-\u9fff]', zh_title):
-            new_cache[link] = {"zh_title": zh_title, "zh_summary": zh_summary}
+            if re.search(r'[\u4e00-\u9fff]', zh_title):
+                translations[link] = {"zh_title": zh_title, "zh_summary": zh_summary, "ts": now}
 
         fe = fg.add_entry()
         fe.id(link)
@@ -264,7 +286,7 @@ for key, (cn_name, url) in FEEDS.items():
         if published:
             fe.published(published)
 
-        all_items.append({
+        new_fetched_items.append({
             "source": cn_name,
             "raw_title": raw_title,
             "zh_title": zh_title,
@@ -272,67 +294,84 @@ for key, (cn_name, url) in FEEDS.items():
             "has_summary": bool(zh_summary),
             "link": link,
             "published": published,
-            "timestamp": get_timestamp(published),
-            "keywords": extract_keywords(raw_title),
-            "related": []
+            "timestamp": ts,
+            "keywords": extract_keywords(raw_title)
         })
 
     fg.rss_file(f"public/{key}.xml")
-    print(f"已生成: public/{key}.xml")
 
-# 保存翻译缓存
-if len(new_cache) > 500:
-    keys_to_keep = list(new_cache.keys())[-500:]
-    new_cache = {k: new_cache[k] for k in keys_to_keep}
-with open("public/cache.json", "w", encoding="utf-8") as f:
-    json.dump(new_cache, f, ensure_ascii=False)
+# 2. 按发布时间正序将新文章并入 48 小时事件库（锁定首个报道的 event_id 防重复弹出）
+new_fetched_items.sort(key=lambda x: x["timestamp"])
 
-# 2. 按发布时间倒序排列并执行跨媒体去重
-all_items.sort(key=lambda x: x["timestamp"], reverse=True)
-unique_items = []
-
-for item in all_items:
-    matched = False
-    for u in unique_items:
-        if is_duplicate(item["keywords"], u["keywords"]):
-            if item["source"] != u["source"] and all(r["source"] != item["source"] for r in u["related"]):
-                u["related"].append(item)
-                if not u["has_summary"] and item["has_summary"]:
-                    u["zh_summary"] = f"（据{item['source']}摘要）{item['zh_summary']}"
-                    u["has_summary"] = True
-            matched = True
+for item in new_fetched_items:
+    matched_event = None
+    for ev in events:
+        # 网址已存在或关键词命中，均归入同一历史事件
+        if any(s["link"] == item["link"] for s in ev["sources"]) or is_duplicate(item["keywords"], ev["keywords"]):
+            matched_event = ev
             break
-    if not matched:
-        unique_items.append(item)
 
-# 3. 生成最终去重聚合总源 (all.xml)
+    if matched_event:
+        # 仅当该媒体尚未记录在此事件中时，追加到出处列表
+        if all(s["source"] != item["source"] for s in matched_event["sources"]):
+            matched_event["sources"].append({
+                "source": item["source"],
+                "raw_title": item["raw_title"],
+                "zh_title": item["zh_title"],
+                "link": item["link"]
+            })
+            if not matched_event["has_summary"] and item["has_summary"]:
+                matched_event["zh_summary"] = f"（据{item['source']}摘要）{item['zh_summary']}"
+                matched_event["has_summary"] = True
+    else:
+        events.append({
+            "event_id": item["link"],  # 永久锁定此事件的唯一ID
+            "first_seen": now,
+            "published": item["published"],
+            "timestamp": item["timestamp"],
+            "keywords": item["keywords"],
+            "zh_summary": item["zh_summary"],
+            "has_summary": item["has_summary"],
+            "sources": [{
+                "source": item["source"],
+                "raw_title": item["raw_title"],
+                "zh_title": item["zh_title"],
+                "link": item["link"]
+            }]
+        })
+
+# 3. 保存更新后的 48 小时状态缓存
+with open(CACHE_FILE, "w", encoding="utf-8") as f:
+    json.dump({"translations": translations, "events": events}, f, ensure_ascii=False)
+
+# 4. 生成最终去重聚合总源 (all.xml)
+events.sort(key=lambda x: x["timestamp"], reverse=True)
 fg_all = FeedGenerator()
 fg_all.title("全球外媒热点 (10家去重版)")
 fg_all.link(href="https://github.com")
-fg_all.description("BBC/CNBC/FT/经济学人/纽时/WSJ/彭博/路透/美联社/CNN 实时中文去重聚合")
+fg_all.description("BBC/CNBC/FT/经济学人/纽时/WSJ/彭博/路透/美联社/CNN 48小时跨批次去重聚合")
 
-for item in unique_items[:40]:
+for ev in events[:40]:
     fe = fg_all.add_entry()
-    fe.id(item["link"])
+    fe.id(ev["event_id"])  # 使用锁定的 event_id，NetNewsWire 原地更新不重复弹窗
 
-    all_sources = [item] + item["related"]
-    total_sources = len(all_sources)
-
-    title_prefix = f"[{item['source']}等{total_sources}家] " if total_sources > 1 else f"[{item['source']}] "
+    primary = ev["sources"][0]
+    total_sources = len(ev["sources"])
+    title_prefix = f"[{primary['source']}等{total_sources}家] " if total_sources > 1 else f"[{primary['source']}] "
 
     sources_list_html = f"<b>报道出处（共 {total_sources} 家，点击查阅原文）：</b><br>" + "<br><br>".join(
         [
             f"• <b>[{s['source']}]</b> <a href='{s['link']}'>{s['zh_title']}</a><br><small>原文：{s['raw_title']}</small>"
-            for s in all_sources
+            for s in ev["sources"]
         ]
     )
 
-    desc_html = f"{item['zh_summary']}<hr>" if item['zh_summary'] else ""
-    fe.title(f"{title_prefix}{item['zh_title']}")
-    fe.link(href=item["link"])
+    desc_html = f"{ev['zh_summary']}<hr>" if ev["zh_summary"] else ""
+    fe.title(f"{title_prefix}{primary['zh_title']}")
+    fe.link(href=primary["link"])
     fe.description(f"{desc_html}{sources_list_html}")
-    if item["published"]:
-        fe.published(item["published"])
+    if ev["published"]:
+        fe.published(ev["published"])
 
 fg_all.rss_file("public/all.xml")
-print(f"已生成聚合去重源: public/all.xml (原 {len(all_items)} 条 -> 去重后 {len(unique_items)} 条)")
+print(f"已生成聚合去重源: public/all.xml (48h活跃事件共 {len(events)} 个)")
