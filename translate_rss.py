@@ -1,5 +1,6 @@
 import os
 import re
+import json
 import time
 import requests
 import feedparser
@@ -20,7 +21,7 @@ FEEDS = {
 }
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
 }
 
 STOP_WORDS = {
@@ -29,6 +30,22 @@ STOP_WORDS = {
     "and", "or", "but", "not", "says", "say", "after", "over", "amid", "new",
     "into", "about", "up", "out", "will", "has", "have", "had", "its", "us"
 }
+
+def load_cache():
+    """从已发布的 GitHub Pages 拉取历史翻译缓存，避免重复翻译耗尽额度"""
+    repo = os.environ.get("GITHUB_REPOSITORY", "")
+    if "/" in repo:
+        owner, name = repo.split("/", 1)
+        cache_url = f"https://{owner}.github.io/{name}/cache.json"
+        try:
+            r = requests.get(cache_url, timeout=10)
+            if r.status_code == 200:
+                data = r.json()
+                print(f"成功加载历史翻译缓存: {len(data)} 条")
+                return data
+        except Exception:
+            pass
+    return {}
 
 def clean_html(text):
     if not text:
@@ -67,30 +84,61 @@ def get_timestamp(pub_str):
     except Exception:
         return 0
 
-def google_translate(text):
+def translate_with_edge(text):
+    """备用引擎：微软 Edge 免费翻译接口"""
+    try:
+        auth_resp = requests.get("https://edge.microsoft.com/translate/auth", headers=HEADERS, timeout=8)
+        if auth_resp.status_code == 200:
+            token = auth_resp.text
+            url = "https://api-edge.cognitive.microsofttranslator.com/translate"
+            params = {"from": "en", "to": "zh-Hans", "api-version": "3.0"}
+            headers = {
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json"
+            }
+            r = requests.post(url, params=params, headers=headers, json=[{"Text": text[:1500]}], timeout=10)
+            if r.status_code == 200:
+                return r.json()[0]["translations"][0]["text"]
+    except Exception as e:
+        print(f"Edge 备用翻译失败: {e}")
+    return None
+
+def smart_translate(text):
+    """主引擎谷歌 + 备用引擎微软双保险"""
     if not text:
         return ""
-    url = "https://translate.googleapis.com/translate_a/single"
-    params = {
-        "client": "gtx",
-        "sl": "en",
-        "tl": "zh-CN",
-        "dt": "t",
-        "q": text[:1500]
-    }
+    # 1. 尝试谷歌接口
     try:
-        r = requests.get(url, params=params, headers=HEADERS, timeout=10)
+        r = requests.get(
+            "https://translate.googleapis.com/translate_a/single",
+            params={"client": "gtx", "sl": "en", "tl": "zh-CN", "dt": "t", "q": text[:1500]},
+            headers=HEADERS,
+            timeout=8
+        )
         if r.status_code == 200:
-            data = r.json()
-            return "".join([item[0] for item in data[0] if item[0]])
-    except Exception as e:
-        print(f"翻译失败: {e}")
+            res = "".join([item[0] for item in r.json()[0] if item[0]])
+            if res and res != text:
+                time.sleep(0.8)  # 放慢节奏防止触发谷歌风控
+                return res
+        else:
+            print(f"谷歌翻译触发限流 (HTTP {r.status_code})，切换至微软备用接口...")
+    except Exception:
+        pass
+
+    # 2. 谷歌失败或被限流时，自动切换微软 Edge 接口
+    edge_res = translate_with_edge(text)
+    if edge_res:
+        time.sleep(0.5)
+        return edge_res
+
     return text
 
 os.makedirs("public", exist_ok=True)
+cache = load_cache()
+new_cache = {}
 all_items = []
 
-# 1. 抓取并翻译10家媒体
+# 1. 抓取并增量翻译10家媒体（每家取最新5条，减少无效请求）
 for key, (cn_name, url) in FEEDS.items():
     try:
         resp = requests.get(url, headers=HEADERS, timeout=15)
@@ -104,7 +152,7 @@ for key, (cn_name, url) in FEEDS.items():
     fg.link(href=url)
     fg.description(f"{cn_name} 自动中文翻译源")
 
-    for entry in parsed.entries[:8]:
+    for entry in parsed.entries[:5]:
         raw_title = entry.get("title", "").strip()
         if not raw_title:
             continue
@@ -113,20 +161,22 @@ for key, (cn_name, url) in FEEDS.items():
 
         raw_summary = clean_html(entry.get("summary", "") or entry.get("description", ""))
         valid_summary = has_real_summary(raw_title, raw_summary)
-
-        zh_title = google_translate(raw_title)
-        time.sleep(0.25)
-
-        if valid_summary:
-            zh_summary = google_translate(raw_summary)
-            time.sleep(0.25)
-        else:
-            zh_summary = ""
-
         link = entry.get("link", url)
         published = entry.get("published", "")
 
-        # 单家媒体独立源：有摘要时在摘要与出处间加分割线
+        # 优先命中缓存（仅当缓存里的翻译确实包含中文时才复用，防止把之前未翻译成功的英文缓存下来）
+        cached_item = cache.get(link)
+        if cached_item and re.search(r'[\u4e00-\u9fff]', cached_item.get("zh_title", "")):
+            zh_title = cached_item["zh_title"]
+            zh_summary = cached_item.get("zh_summary", "")
+        else:
+            zh_title = smart_translate(raw_title)
+            zh_summary = smart_translate(raw_summary) if valid_summary else ""
+
+        # 仅将成功翻译出中文的结果写入新缓存
+        if re.search(r'[\u4e00-\u9fff]', zh_title):
+            new_cache[link] = {"zh_title": zh_title, "zh_summary": zh_summary}
+
         fe = fg.add_entry()
         fe.id(link)
         fe.title(zh_title)
@@ -142,7 +192,7 @@ for key, (cn_name, url) in FEEDS.items():
             "raw_title": raw_title,
             "zh_title": zh_title,
             "zh_summary": zh_summary,
-            "has_summary": valid_summary,
+            "has_summary": bool(zh_summary),
             "link": link,
             "published": published,
             "timestamp": get_timestamp(published),
@@ -152,6 +202,13 @@ for key, (cn_name, url) in FEEDS.items():
 
     fg.rss_file(f"public/{key}.xml")
     print(f"已生成: public/{key}.xml")
+
+# 保存最新翻译缓存供下一次运行复用（最多保留最近500条防膨胀）
+if len(new_cache) > 500:
+    keys_to_keep = list(new_cache.keys())[-500:]
+    new_cache = {k: new_cache[k] for k in keys_to_keep}
+with open("public/cache.json", "w", encoding="utf-8") as f:
+    json.dump(new_cache, f, ensure_ascii=False)
 
 # 2. 按发布时间倒序排列并执行跨媒体去重
 all_items.sort(key=lambda x: x["timestamp"], reverse=True)
@@ -184,10 +241,7 @@ for item in unique_items[:40]:
     all_sources = [item] + item["related"]
     total_sources = len(all_sources)
 
-    if total_sources > 1:
-        title_prefix = f"[{item['source']}等{total_sources}家] "
-    else:
-        title_prefix = f"[{item['source']}] "
+    title_prefix = f"[{item['source']}等{total_sources}家] " if total_sources > 1 else f"[{item['source']}] "
 
     sources_list_html = f"<b>报道出处（共 {total_sources} 家，点击查阅原文）：</b><br>" + "<br><br>".join(
         [
@@ -196,8 +250,7 @@ for item in unique_items[:40]:
         ]
     )
 
-    # 有摘要时在摘要与出处之间加入分割线 <hr>
-    desc_html = f"{item['zh_summary']}<hr>" if item["zh_summary"] else ""
+    desc_html = f"{item['zh_summary']}<hr>" if item['zh_summary'] else ""
     fe.title(f"{title_prefix}{item['zh_title']}")
     fe.link(href=item["link"])
     fe.description(f"{desc_html}{sources_list_html}")
