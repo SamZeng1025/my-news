@@ -9,6 +9,8 @@ from feedgen.feed import FeedGenerator
 
 FEEDS = {
     "bbc": ("BBC", "http://feeds.bbci.co.uk/news/world/rss.xml"),
+    "npr": ("NPR", "https://feeds.npr.org/1001/rss.xml"),
+    "guardian": ("卫报", "https://www.theguardian.com/world/rss"),
     "cnbc": ("CNBC", "https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=100727362"),
     "ft": ("金融时报", "https://www.ft.com/rss/home/international"),
     "economist": ("经济学人", "https://www.economist.com/international/rss.xml"),
